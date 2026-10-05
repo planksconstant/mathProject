@@ -1,3 +1,4 @@
+"""RGB <-> YCbCr (full-range BT.601, same as JPEG) and 2x2 chroma subsampling."""
 import numpy as np
 
 
@@ -31,3 +32,25 @@ def upsample(ch: np.ndarray, shape) -> np.ndarray:
     """Nearest-neighbour 2x upsample, cropped back to `shape`."""
     up = np.repeat(np.repeat(ch, 2, axis=0), 2, axis=1)
     return up[: shape[0], : shape[1]]
+
+
+# ---- helpers shared by the DCT and DWT codecs ----
+
+def plane_shapes(H: int, W: int, sub: bool):
+    cs = ((H + 1) // 2, (W + 1) // 2) if sub else (H, W)
+    return [(H, W), cs, cs]
+
+
+def split_planes(rgb: np.ndarray, sub: bool):
+    ycc = rgb_to_ycbcr(rgb)
+    y, cb, cr = ycc[..., 0], ycc[..., 1], ycc[..., 2]
+    if sub:
+        cb, cr = subsample(cb), subsample(cr)
+    return [y, cb, cr]
+
+
+def merge_planes(planes, H: int, W: int, sub: bool) -> np.ndarray:
+    y, cb, cr = planes
+    if sub:
+        cb, cr = upsample(cb, (H, W)), upsample(cr, (H, W))
+    return ycbcr_to_rgb(np.stack([y, cb, cr], axis=-1))

@@ -1,7 +1,10 @@
+"""JPEG-style codec with a real bitstream.
+YCbCr -> 4:2:0 -> 8x8 DCT -> quantize -> zigzag -> DC delta / AC run-size -> Huffman."""
 import numpy as np
 
-import entropy
-from colorspace import rgb_to_ycbcr, ycbcr_to_rgb, subsample, upsample
+import container
+import rle
+from colorspace import plane_shapes, split_planes, merge_planes
 
 N = 8
 
@@ -48,7 +51,6 @@ ZI, ZJ = _zigzag()
 
 
 def quant_table(base: np.ndarray, quality: int) -> np.ndarray:
-    """libjpeg quality scaling. quality in 1..100."""
     quality = int(np.clip(quality, 1, 100))
     scale = 5000 / quality if quality < 50 else 200 - 2 * quality
     return np.clip(np.floor((base * scale + 50) / 100), 1, 255)
@@ -78,22 +80,53 @@ def decode_channel(q: np.ndarray, qt: np.ndarray, shape) -> np.ndarray:
     return from_blocks(blocks, shape) + 128.0
 
 
-def run(rgb: np.ndarray, quality: int = 50, chroma_subsample: bool = True):
-    """Returns (reconstructed_rgb, compressed_size_bytes)."""
+# ---- bitstream layer ----
+
+def _tables(quality):
+    return [quant_table(Q_LUM, quality)] + [quant_table(Q_CHROM, quality)] * 2
+
+
+def _write_channel(q: np.ndarray) -> bytes:
+    zz = q[..., ZI, ZJ].reshape(-1, N * N)       # zigzag every block
+    dc = np.diff(zz[:, 0], prepend=0)            # DC is delta-coded across blocks
+    tokens = []
+    for b in range(zz.shape[0]):
+        rle.dc_token(int(dc[b]), 0, tokens)
+        rle.vector_tokens(zz[b, 1:], 1, tokens)
+    return container.encode_tokens(tokens, 2)
+
+
+def _read_channel(payload: bytes, shape) -> np.ndarray:
+    bh, bw = -(-shape[0] // N), -(-shape[1] // N)
+    cr = container.ChannelReader(payload, 2)
+    zz = np.zeros((bh * bw, N * N), dtype=np.int32)
+    dc = 0
+    for b in range(bh * bw):
+        dc += rle.read_dc(cr, 0)
+        zz[b, 0] = dc
+        zz[b, 1:] = rle.read_vector(cr, N * N - 1, 1)
+    q = np.zeros((bh, bw, N, N), dtype=np.int32)
+    q[..., ZI, ZJ] = zz.reshape(bh, bw, N * N)
+    return q
+
+
+def _reconstruct(qs, quality, H, W, sub):
+    shapes = plane_shapes(H, W, sub)
+    planes = [decode_channel(q, qt, s) for q, qt, s in zip(qs, _tables(quality), shapes)]
+    return merge_planes(planes, H, W, sub)
+
+
+def encode(rgb: np.ndarray, quality: int = 50, subsample_chroma: bool = True):
+    """-> (p1, p2, flags, body, encoder_side_reconstruction)"""
     H, W = rgb.shape[:2]
-    ycc = rgb_to_ycbcr(rgb)
-    chans = [ycc[..., 0], ycc[..., 1], ycc[..., 2]]
-    if chroma_subsample:
-        chans[1], chans[2] = subsample(chans[1]), subsample(chans[2])
+    planes = split_planes(rgb, subsample_chroma)
+    qs = [encode_channel(p, qt) for p, qt in zip(planes, _tables(quality))]
+    body = container.frame([_write_channel(q) for q in qs])
+    return quality, 0, int(subsample_chroma), body, _reconstruct(qs, quality, H, W, subsample_chroma)
 
-    qts = [quant_table(Q_LUM, quality)] + [quant_table(Q_CHROM, quality)] * 2
-    size, recon = 0, []
-    for ch, qt in zip(chans, qts):
-        q = encode_channel(ch, qt)
-        zz = q[..., ZI, ZJ].reshape(-1, N * N)   # zigzag every block
-        size += entropy.blocks_size_bytes(zz)
-        recon.append(decode_channel(q, qt, ch.shape))
 
-    if chroma_subsample:
-        recon[1], recon[2] = upsample(recon[1], (H, W)), upsample(recon[2], (H, W))
-    return ycbcr_to_rgb(np.stack(recon, axis=-1)), size
+def decode(W, H, p1, p2, flags, body) -> np.ndarray:
+    sub = bool(flags & 1)
+    shapes = plane_shapes(H, W, sub)
+    qs = [_read_channel(sec, s) for sec, s in zip(container.unframe(body, 3), shapes)]
+    return _reconstruct(qs, p1, H, W, sub)

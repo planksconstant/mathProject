@@ -1,7 +1,10 @@
 """Usage:
-    python src/main.py photo.png                       # run everything
+    python src/main.py photo.png                         # all methods
+    python src/main.py photo.png -m dwt -q 60 -l 4
     python src/main.py photo.png -m dct -q 30
     python src/main.py photo.png -m svd -k 40
+Writes <out>/<name>.imgc (the real compressed file) and <out>/<name>.png (decoded, for viewing).
+Every file is decoded back from disk bytes and checked against the encoder's own reconstruction.
 """
 import argparse
 import os
@@ -9,43 +12,41 @@ import os
 import numpy as np
 from PIL import Image
 
-import dct_codec
-import entropy
+import codec
 import metrics
-import svd_codec
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("image")
-    ap.add_argument("-m", "--method", choices=["dct", "svd", "lossless", "all"], default="all")
-    ap.add_argument("-q", "--quality", type=int, default=50, help="DCT quality 1-100")
-    ap.add_argument("-k", "--rank", type=int, default=20, help="SVD rank per channel")
+    ap.add_argument("-m", "--method", choices=["lossless", "dct", "dwt", "svd", "all"], default="all")
+    ap.add_argument("-q", "--quality", type=int, default=50, help="dct/dwt quality 1-100")
+    ap.add_argument("-l", "--levels", type=int, default=3, help="dwt decomposition levels")
+    ap.add_argument("-k", "--rank", type=int, default=20, help="svd rank per channel")
     ap.add_argument("--no-subsample", action="store_true", help="disable 4:2:0 chroma subsampling")
     ap.add_argument("-o", "--out", default="out")
     a = ap.parse_args()
 
     rgb = np.array(Image.open(a.image).convert("RGB"))
-    raw = rgb.size  # H*W*3 bytes
+    raw = rgb.size
     os.makedirs(a.out, exist_ok=True)
-    print(f"{a.image}: {rgb.shape[1]}x{rgb.shape[0]}, raw {raw} bytes")
-    print(f"{'method':<12}{'bytes':>10}{'ratio':>9}{'PSNR dB':>10}{'MSE':>10}")
+    print(f"{a.image}: {rgb.shape[1]}x{rgb.shape[0]}, raw {raw} B, input file {os.path.getsize(a.image)} B")
+    print(f"{'file':<14}{'bytes':>9}{'ratio':>8}{'PSNR dB':>9}{'MSE':>9}  roundtrip")
 
-    def report(name, size, recon):
-        p = metrics.psnr(rgb, recon)
-        print(f"{name:<12}{size:>10}{metrics.compression_ratio(raw, size):>9.2f}{p:>10.2f}{metrics.mse(rgb, recon):>10.2f}")
-        Image.fromarray(recon).save(os.path.join(a.out, f"{name}.png"))
-
-    if a.method in ("lossless", "all"):
-        report("lossless", entropy.lossless_size_bytes(rgb), rgb)
-    if a.method in ("dct", "all"):
-        recon, size = dct_codec.run(rgb, a.quality, not a.no_subsample)
-        report(f"dct_q{a.quality}", size, recon)
-    if a.method in ("svd", "all"):
-        h, w = rgb.shape[:2]
-        recon, size = svd_codec.run(rgb, a.rank)
-        report(f"svd_k{a.rank}", size, recon)
-        print(f"(svd only saves space below rank ~{svd_codec.break_even_rank(h, w)})")
+    names = {"lossless": "lossless", "dct": f"dct_q{a.quality}",
+             "dwt": f"dwt_q{a.quality}_l{a.levels}", "svd": f"svd_k{a.rank}"}
+    todo = list(codec.METHODS) if a.method == "all" else [a.method]
+    for m in todo:
+        data, enc_recon = codec.compress(rgb, m, a.quality, a.levels, a.rank, not a.no_subsample)
+        path = os.path.join(a.out, names[m] + ".imgc")
+        with open(path, "wb") as f:
+            f.write(data)
+        with open(path, "rb") as f:
+            dec = codec.decompress(f.read())
+        ok = np.array_equal(dec, enc_recon) and (m != "lossless" or np.array_equal(dec, rgb))
+        Image.fromarray(dec).save(os.path.join(a.out, names[m] + ".png"))
+        p = metrics.psnr(rgb, dec)
+        print(f"{names[m]:<14}{len(data):>9}{raw / len(data):>8.2f}{p:>9.2f}{metrics.mse(rgb, dec):>9.2f}  {'OK' if ok else 'MISMATCH'}")
 
 
 if __name__ == "__main__":
